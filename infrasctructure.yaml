@@ -1,0 +1,585 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "ECS Blue/Green Deployment for Node.js Application with Public Subnets"
+
+Parameters:
+  EnvironmentName:
+    Description: "An environment name that will be prefixed to resource names"
+    Type: String
+    Default: "week7dev"
+  ContainerPort:
+    Description: "The port number on the container"
+    Type: Number
+    Default: 5000
+  ContainerImage:
+    Description: "The image URI"
+    Type: String
+    Default: "public.ecr.aws/a8o4o2p9/week7-repository:danielkwadwosah_week7nodeapp"
+  ECRRepositoryName:
+    Description: "ECR repository name for the container"
+    Type: String
+    Default: "week7-repository"
+  TaskCPU:
+    Description: "The CPU units for the task"
+    Type: Number
+    Default: 256
+  TaskMemory:
+    Description: "The memory (MB) for the task"
+    Type: Number
+    Default: 512
+  DesiredCount:
+    Description: "The desired number of tasks"
+    Type: Number
+    Default: 1
+  DynamoDBTableName:
+    Description: "The name of the DynamoDB table the app will access"
+    Type: String
+    Default: "MyWeek7Table"
+  AccessKeyIdParameter:
+    Description: "SSM Parameter Store path for AWS Access Key ID"
+    Type: String
+    Default: "/access-key-id"
+  SecretAccessKeyParameter:
+    Description: "SSM Parameter Store path for AWS Secret Access Key"
+    Type: String
+    Default: "/secret-access-key"
+  PortParameter:
+    Description: "SSM Parameter Store path for Port"
+    Type: String
+    Default: "/port"
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: [VPC, InternetGateway]
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: [PublicRouteTable, VPCGatewayAttachment]
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [PublicSubnet1, PublicRouteTable]
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [PublicSubnet2, PublicRouteTable]
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      GroupDescription: !Sub "Security group for ${EnvironmentName} ALB"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      GroupDescription: !Sub "Security group for ${EnvironmentName} ECS tasks"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ecs-sg
+
+  # KMS Key for encrypting SSM Parameters (best practice)
+  SSMKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for encrypting SSM parameters in ${EnvironmentName}"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-default-1
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow ECS to use the key
+            Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ssm-kms-key"
+
+  SSMKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${EnvironmentName}-ssm-key"
+      TargetKeyId: !Ref SSMKMSKey
+
+  # Updated ECSExecutionRole with additional SSM permissions
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-ecs-execution-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "ecr:GetRepositoryPolicy"
+                  - "ecr:DescribeRepositories"
+                  - "ecr:ListImages"
+                  - "ecr:DescribeImages"
+                Resource: !Sub "arn:aws:ecr-public::${AWS::AccountId}:repository/${ECRRepositoryName}"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              # Add permissions for SSM Parameter Store
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameters"
+                  - "ssm:GetParameter"
+                  - "ssm:GetParametersByPath"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+              # Add permissions for KMS decryption
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt SSMKMSKey.Arn
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-dynamodb-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                  - "dynamodb:BatchWriteItem"
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTableName}"
+        - PolicyName: !Sub "${EnvironmentName}-ssm-parameters"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameters"
+                  - "ssm:GetParameter"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  # ALB Resources (unchanged from original)
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: [PublicSubnet1, PublicSubnet2, ALBSecurityGroup]
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - ApplicationLoadBalancer
+      - BlueTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Test listener for blue/green deployments
+  ALBTestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - ApplicationLoadBalancer
+      - GreenTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 5000 # Different port for test traffic
+      Protocol: HTTP
+
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: VPC
+    Properties:
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Name: !Sub ${EnvironmentName}-blue-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: VPC
+    Properties:
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Name: !Sub ${EnvironmentName}-green-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+
+  # ECS Resources
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-cluster
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1
+
+  # ECS Resources
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: [ECSExecutionRole, ECSTaskRole]
+    Properties:
+      Family: !Sub ${EnvironmentName}-task-def
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCPU
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub ${EnvironmentName}-container
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: TABLE_NAME
+              Value: !Ref DynamoDBTableName
+            - Name: ENVIRONMENT
+              Value: !Ref EnvironmentName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: AWS_ACCESS_KEY_ID
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AccessKeyIdParameter}"
+            - Name: AWS_SECRET_ACCESS_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretAccessKeyParameter}"
+            - Name: PORT
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PortParameter}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: [ALBListener, ECSTaskDefinition, ECSCluster, BlueTargetGroup]
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ECSTaskDefinition
+      HealthCheckGracePeriodSeconds: 120 # Increased grace period
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      LoadBalancers:
+        - ContainerName: !Sub ${EnvironmentName}-container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # CodeDeploy Resources (unchanged from original)
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${EnvironmentName}-app
+      ComputePlatform: ECS
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [codedeploy.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
+        - "arn:aws:iam::aws:policy/AmazonEC2FullAccess" # Added
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-additional-permissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecs:DescribeServices"
+                  - "ecs:CreateTaskSet"
+                  - "ecs:RegisterTaskDefinition"
+                  - "ecs:UpdateServicePrimaryTaskSet"
+                  - "ecs:DeleteTaskSet"
+                  - "elasticloadbalancing:*"
+                  - "cloudwatch:*"
+                Resource: "*"
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: [CodeDeployApplication, BlueTargetGroup, GreenTargetGroup]
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub ${EnvironmentName}-dg
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+      ECSServices:
+        - ServiceName: !GetAtt ECSService.Name
+          ClusterName: !Ref ECSCluster
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt BlueTargetGroup.TargetGroupName
+              - Name: !GetAtt GreenTargetGroup.TargetGroupName
+            ProdTrafficRoute:
+              ListenerArns: 
+                - !Ref ALBListener
+            TestTrafficRoute:
+              ListenerArns: 
+                - !Ref ALBTestListener
+
+  # Logging (unchanged from original)
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}
+      RetentionInDays: 7
+
+  # Auto Scaling (unchanged from original)
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [application-autoscaling.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole"
+
+  ECSServiceAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: [ECSService, AutoScalingRole]
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 1
+      ResourceId: !Sub service/${ECSCluster}/${EnvironmentName}-service
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ECSServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ECSServiceAutoScaling
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+Outputs:
+  ALBDNSName:
+    Description: "The DNS name of the ALB"
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  ECSClusterName:
+    Description: "The name of the ECS Cluster"
+    Value: !Ref ECSCluster
+  ECSServiceName:
+    Description: "The name of the ECS Service"
+    Value: !GetAtt ECSService.Name
+  CodeDeployApplicationName:
+    Description: "The name of the CodeDeploy Application"
+    Value: !Ref CodeDeployApplication
+  CodeDeployDeploymentGroupName:
+    Description: "The name of the CodeDeploy Deployment Group"
+    Value: !Ref CodeDeployDeploymentGroup # Changed from GetAtt to Ref
+  CodeDeployServiceRoleArn:
+    Description: "ARN of the CodeDeploy Service Role"
+    Value: !GetAtt CodeDeployRole.Arn
